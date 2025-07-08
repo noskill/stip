@@ -33,10 +33,11 @@ W2′ = W2 π
 
 # inference
 
-at inference it should work as follows:
+at inference it works as follows:
 
 1. transform x to x′ = x π
 2. compute fθ′(x′) = y′
 3. compute y = y′ π'
 
-we need to emulate the situation when the host where llm inference is taking place don't have access to π or original θ
+we need to emulate the situation when the host where llm inference is taking place don't have access to π or original θ,
+but currently last layer of LlamaForCausalLM performs reverse transformation, so the "host" has access to llm output
