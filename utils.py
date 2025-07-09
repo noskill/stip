@@ -14,6 +14,9 @@ def _permute_model_parameters(model, pi):
     The single pi is applied across all layers. Embeddings (and the tied lm_head), attention,
     feedforward (SwiGLU), and LayerNorm weights/biases are permuted."""
     pi = torch.as_tensor(pi)
+    # STIP uses the following convention: PyTorch Linear layers store weight as Wᵀ (out_features × in_features).
+    # So for a STIP transform W' = πᵀ·W, we implement weight @ π;
+    # and for a transform W' = W·π, we implement πᵀ @ weight.
     # Only Llama-based models with model.model.layers support permutation; otherwise no-op
     if not hasattr(model, 'model') or not hasattr(model.model, 'layers'):
         return
@@ -30,11 +33,16 @@ def _permute_model_parameters(model, pi):
         if hasattr(module, 'bias') and module.bias is not None:
             raise RuntimeError(f"Unexpected bias in module '{name}'")
     with torch.no_grad():
-        # Permute input embedding and LM head weight
+        # Permute input embedding and LM head weight (W_e, W_lm): shape [vocab_size, d]
+        #   W' = W · π  (permute embedding/​head dimensions, matching readme's x·π)
         pi_embed = pi.to(device=embed.weight.device)
         embed.weight.copy_(embed.weight @ pi_embed)
         head = model.lm_head
         pi_head = pi.to(device=head.weight.device)
+        # head.weight = Wᵀ
+        # weight = head.weight @ pi_head  equivalent to W′ᵀ = Wᵀ · π
+        # logits = h · (Wᵀ)ᵀ for unmodified transformer
+        # logits = h π · (W′ᵀ)ᵀ = h π · (Wᵀ · π)ᵀ = h π ·πᵀ W = h W for permuted transformer
         head.weight.copy_(head.weight @ pi_head)
 
         # Permute each Transformer block on its own device
@@ -43,13 +51,20 @@ def _permute_model_parameters(model, pi):
             pi_layer = pi.to(device=dev)
             pi_t = pi_layer.t()
 
-            # Attention: Wq',Wk',Wv' = πᵀ·Wq,πᵀ·Wk,πᵀ·Wv → weight @ π; Wo' = Wo·π → πᵀ @ weight
+            # Attention projections:
+            # - q_proj/k_proj/v_proj.weight stores Wqᵀ/Wkᵀ/Wvᵀ, so to implement W' = πᵀ·W (readme), we do weight @ π
+            # - o_proj.weight stores Woᵀ, so to implement W' = W·π (readme), we do πᵀ @ weight
             layer.self_attn.q_proj.weight.copy_(layer.self_attn.q_proj.weight @ pi_layer)
             layer.self_attn.k_proj.weight.copy_(layer.self_attn.k_proj.weight @ pi_layer)
             layer.self_attn.v_proj.weight.copy_(layer.self_attn.v_proj.weight @ pi_layer)
             layer.self_attn.o_proj.weight.copy_(pi_t @ layer.self_attn.o_proj.weight)
 
-            # Feedforward (SwiGLU): gate_proj/up_proj (W1') = πᵀ·W1 → weight @ π; down_proj (W2') = W2·π → πᵀ @ weight
+            # Feedforward (SwiGLU): gate_proj (W1) and up_proj (W3) parameters have shape (m×d), so
+            #   W1' = πᵀ·W1 and W3' = πᵀ·W3      → weight @ π
+            # down_proj parameter stores W2ᵀ (shape d×m) for W2∈ℝ^{m×d}, so
+            #   W2' = W2·π      ⟹ (W2·π)ᵀ = πᵀ·W2ᵀ → πᵀ @ weight
+            # After permuting down_proj (W2) and up_proj (W3) weights, users will need to perform permuted-features -> logits transformation
+            # (see readme.txt line 65)
             layer.mlp.gate_proj.weight.copy_(layer.mlp.gate_proj.weight @ pi_layer)
             layer.mlp.up_proj.weight.copy_(layer.mlp.up_proj.weight @ pi_layer)
             layer.mlp.down_proj.weight.copy_(pi_t @ layer.mlp.down_proj.weight)
