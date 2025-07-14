@@ -1,4 +1,4 @@
-from utils import get_model, model as MODEL_NAME
+from utils import get_model_pi, model as MODEL_NAME
 import torch
 from transformers import AutoConfig
 
@@ -10,7 +10,7 @@ if __name__ == "__main__":
     pi = torch.eye(d, dtype=torch.float32)[perm]
 
     # Create a text-generation pipeline with permuted parameters
-    pipeline = get_model(pi=pi)
+    pipeline = get_model_pi(pi=pi)
 
     # Generate text
     prompt = "import socket\n\n" \

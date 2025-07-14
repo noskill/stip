@@ -1,11 +1,25 @@
 import torch
 from transformers import AutoTokenizer
 import transformers
-
+import math
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 
 model = "codellama/CodeLlama-7b-hf"
+
+
+# -------------------------------------------------------------------------
+# 2.  Add dense high-rank ΔW  (≈ 30 % spectral norm of W)
+# -------------------------------------------------------------------------
+def _add_dense_noise(model, rho: float = 0.30):
+    """In-place:   W ← W + ΔW   with  ‖ΔW‖₂ ≈ rho · ‖W‖₂."""
+    with torch.no_grad():
+        for p in model.parameters():
+            if p.ndim == 2:                                 # linear weight
+                g = torch.randn_like(p)
+                g *= (rho * p.norm(2) / g.norm(2) + 1e-12)
+                p.add_(g)
+
 
 def _permute_model_parameters(model, pi):
     """In-place permute parameters of a Llama-based model according to a permutation matrix pi,
@@ -86,39 +100,201 @@ def _permute_model_parameters(model, pi):
         final_ln.weight.copy_(final_ln.weight @ pi_fn)
         if hasattr(final_ln, 'bias'):
             final_ln.bias.copy_(final_ln.bias @ pi_fn)
+            
 
-def get_model(pi=None):
-    """
-    Build a text-generation pipeline for the specified model.
 
-    If a permutation matrix `pi` (shape [d, d]) is provided, the model's parameters
-    are permuted in memory according to the procedure in readme.txt before inference.
+# -------------------------------------------------------------------------
+# 1.  Build a block-orthogonal rotation that keeps every RoPE pair intact
+# -------------------------------------------------------------------------
+def rope_preserving_R(n_heads: int, head_dim: int = 128,
+                      dtype=torch.float32, device=None) -> torch.Tensor:
     """
+    Return a (d × d) orthogonal matrix R that is block-diagonal per head
+    and, inside every 2-element RoPE pair, a planar rotation.
+
+        d        = n_heads * head_dim
+        head_dim = 128   (64 RoPE pairs) in Llama-2
+
+    Such an R commutes with apply_rotary_pos_emb and allows us to keep
+    RMS-Norm diagonal (because it only re-orders / rotates within pairs).
+    """
+    if head_dim % 2:
+        raise ValueError("head_dim must be even")
+
+    pairs = head_dim // 2
+    d     = n_heads * head_dim
+    R     = torch.zeros((d, d), dtype=dtype, device=device)
+
+    for h in range(n_heads):
+        base = h * head_dim
+        for j in range(pairs):
+            theta  = torch.rand(1, device=device) * 2 * math.pi
+            c, s   = torch.cos(theta), torch.sin(theta)
+            rot2   = torch.tensor([[c, -s],
+                                   [s,  c]], dtype=dtype, device=device)
+            row    = base + 2 * j
+            R[row:row + 2, row:row + 2] = rot2
+    return R
+
+                
+from torch import nn
+class RMSNormRotated(nn.Module):
+    """
+    RMSNorm that assumes its inputs are *already* right-multiplied by a
+    fixed orthogonal matrix R.  Implements
+
+        y  =  (x / rms(x)) · Rᵀ · diag(gamma) · R
+    """
+    def __init__(self, d, eps=1e-5, R=None):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d))     # γ
+        assert R is not None and R.shape == (d, d)
+        self.register_buffer("R", R, persistent=False)  # no grad
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, S, d)
+        print('run rmsnorm')
+        var  = x.pow(2).mean(dim=-1, keepdim=True)
+        xhat = x * torch.rsqrt(var + self.eps)           # step (1)
+
+        # step (2)  :  x̂ @ Rᵀ
+        x_unrot = torch.matmul(xhat.to(self.R.dtype), self.R.t())         # (B,S,d)
+
+        # element-wise γ
+        x_scaled = x_unrot * self.weight.to(device=x_unrot.device,
+                                           dtype=x_unrot.dtype)    # (B,S,d)
+
+        # step (3)  :  back to R-space
+        y = torch.matmul(x_scaled, self.R).to(xhat.dtype)               # (B,S,d)
+        return y
+
+from transformers.models.llama.modeling_llama import LlamaRMSNorm
+
+def replace_rms_with_rotated(model_obj, R):
+    d = model_obj.config.hidden_size
+    R = R.to(model_obj.dtype).to(model_obj.device)
+
+    for layer in model_obj.model.layers:
+        for attr in ("input_layernorm", "post_attention_layernorm"):
+            old_ln = getattr(layer, attr)
+            new_ln = RMSNormRotated(d, old_ln.variance_epsilon, R)
+            new_ln.weight.data.copy_(old_ln.weight.data)   # keep γ
+            setattr(layer, attr, new_ln)
+
+    # final norm at the top of the stack
+    old_top = model_obj.model.norm
+    model_obj.model.norm = RMSNormRotated(d, old_top.variance_epsilon, R)
+    model_obj.model.norm.weight.data.copy_(old_top.weight.data)
+
+
+# -------------------------------------------------------------------------
+# 2.  In-place rotation of *all* parameters that live in ℝd
+# -------------------------------------------------------------------------
+def _rotate_model_parameters_with_R(model, R: torch.Tensor):
+    """
+    Fold an orthogonal rotation R into every Llama weight.
+    – square  (d×d)   :  W′ = Rᵀ W R
+    – tall    (d×m)   :  W′ = Rᵀ W
+    – wide    (m×d)   :  W′ = W R
+    Embedding and lm_head are post-multiplied by R.
+    RMS-Norm scales γ are *not* modified – the new RMSNormRotated takes
+    care of the rotation at run time.
+    """
+    d = model.config.hidden_size
+    assert R.shape == (d, d)
+    R = R.to(torch.float32)                 # master
+
+    emb  = model.model.embed_tokens.weight      # (V, d)
+    head = model.lm_head.weight                # (V, d)  tied
+
+    with torch.no_grad():
+        # embeddings + lm_head
+        emb .copy_((emb .float() @ R.to(emb .device)).to(emb .dtype))
+        head.copy_((head.float() @ R.to(head.device)).to(head.dtype))
+
+        # transformer blocks
+        Rt_cpu = R.T
+        for layer in model.model.layers:
+            # self-attention (square)
+            for proj in ("q_proj", "k_proj", "v_proj"):
+                w = getattr(layer.self_attn, proj).weight   # (d,d)
+                Rt = Rt_cpu.to(w.device)
+                w.copy_((Rt @ w.float() @ R.to(w.device)).to(w.dtype))
+
+            w = layer.self_attn.o_proj.weight               # (d,d)
+            Rt = Rt_cpu.to(w.device)
+            w.copy_((Rt @ w.float() @ R.to(w.device)).to(w.dtype))
+
+            # MLP (rectangular)
+            up   = layer.mlp.up_proj.weight     # (11008 , 4096)
+            gate = layer.mlp.gate_proj.weight   # (11008 , 4096)
+            down = layer.mlp.down_proj.weight   # ( 4096 , 11008)
+
+            up  .copy_((up  .float() @ R.to(up  .device)).to(up  .dtype))
+            gate.copy_((gate.float() @ R.to(gate.device)).to(gate.dtype))
+
+            Rt = Rt_cpu.to(down.device)
+            down.copy_((Rt @ down.float()).to(down.dtype))
+
+
+
+
+def get_model_R():
+
     tokenizer = AutoTokenizer.from_pretrained(model)
-    if pi is not None:
-        model_obj = LlamaForCausalLM.from_pretrained(
+    # load model on a single device in half precision
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model_obj = LlamaForCausalLM.from_pretrained(
             model,
             torch_dtype=torch.float16,
-            device_map="auto",
-        )
-        _permute_model_parameters(model_obj, pi)
-        pipeline = transformers.pipeline(
-            "text-generation",
-            model=model_obj,
-            tokenizer=tokenizer,
-            torch_dtype=torch.float16,
-            device_map="auto",
-        )
-    else:
-        pipeline = transformers.pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            torch_dtype=torch.float16,
-            device_map="auto",
-        )
+    ).to(device)
+
+    # rho = 0.1
+    # print(f'adding noise {rho}')
+    # _add_dense_noise(model_obj, rho)
+    cfg = model_obj.config
+    R    = rope_preserving_R(cfg.num_attention_heads,
+                            cfg.hidden_size // cfg.num_attention_heads,
+                            dtype=torch.float32,
+                            device=next(model_obj.parameters()).device)
+    _rotate_model_parameters_with_R(model_obj, R)
+    replace_rms_with_rotated(model_obj, R)
+    
+    # build a text-generation pipeline on the same device
+    device_id = device.index if device.type == "cuda" else -1
+    pipeline = transformers.pipeline(
+        "text-generation",
+        model=model_obj,
+        tokenizer=tokenizer,
+        torch_dtype=torch.float16,
+        device=device_id,
+    )
     return pipeline
 
 
 
+def get_model_pi(pi):
+
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    # load model on a single device in half precision
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model_obj = LlamaForCausalLM.from_pretrained(
+            model,
+            torch_dtype=torch.float16,
+    ).to(device)
+
+    cfg = model_obj.config
+
+    _permute_model_parameters(model_obj, pi)
+    
+    # build a text-generation pipeline on the same device
+    device_id = device.index if device.type == "cuda" else -1
+    pipeline = transformers.pipeline(
+        "text-generation",
+        model=model_obj,
+        tokenizer=tokenizer,
+        torch_dtype=torch.float16,
+        device=device_id,
+    )
+    return pipeline
 

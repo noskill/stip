@@ -1,6 +1,8 @@
 import torch
-from utils import get_model
-
+from utils import get_model_pi
+from transformers import LlamaConfig, LlamaForCausalLM
+from utils import _permute_model_parameters
+import copy
 
 
 
@@ -33,9 +35,7 @@ def test_identity_permutation():
 
 def test_block_reversibility():
     # Test that a single Transformer block permutes reversibly under π
-    from transformers import LlamaConfig, LlamaForCausalLM
-    from utils import _permute_model_parameters
-    import copy
+
 
     # Small model
     cfg = LlamaConfig(hidden_size=16, intermediate_size=64, num_hidden_layers=1,
@@ -83,6 +83,86 @@ def test_block_reversibility():
     )
     print("✅ Transformer block reversibility under π holds.")
 
+
+# -------------------------------------------------------------------------
+# 3.  Unit test  (single block reversibility under R)
+# -------------------------------------------------------------------------
+def test_block_reversibility_R(llm):
+    """
+    Test that a single Transformer block permutes reversibly under R for the given Llama model.
+    Verifies RMSNorm-only change, rotation-only breakage, and full rotation+RMSNormRotated reversibility.
+    """
+    from utils import _rotate_model_parameters_with_R, rope_preserving_R, replace_rms_with_rotated
+
+    llm = llm.eval()
+    block, rotary = llm.model.layers[0], llm.model.rotary_emb
+    cfg = llm.config
+    device = next(llm.parameters()).device
+    dtype = llm.dtype
+
+    # generate RoPE-preserving rotation
+    n_heads = cfg.num_attention_heads
+    head_dim = cfg.hidden_size // n_heads
+    R = rope_preserving_R(n_heads, head_dim, dtype=dtype, device=device)
+    R_t = R.t()
+
+    # dummy input
+    seq_len = 8
+    x = torch.randn(1, seq_len, cfg.hidden_size, dtype=dtype, device=device)
+    mask = torch.full((1, 1, seq_len, seq_len), float("-inf"),
+                      dtype=dtype, device=device).triu(1)
+    pos_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+    cos, sin = rotary(x, pos_ids)
+
+    # baseline
+    y_baseline = block(x, attention_mask=mask,
+                       position_ids=pos_ids,
+                       position_embeddings=(cos, sin))[0]
+
+    # free GPU memory by offloading original model before cloning
+    llm = llm.cpu()
+
+    # RMSNormRotated only should change outputs
+    llm_norm = copy.deepcopy(llm.cpu()).eval().to(device)
+    replace_rms_with_rotated(llm_norm, R)
+    y_norm = llm_norm.model.layers[0](x, attention_mask=mask,
+                                      position_ids=pos_ids,
+                                      position_embeddings=(cos, sin))[0]
+    delta_norm = (y_baseline - y_norm).abs().max()
+    assert delta_norm > 0, f"Replacing RMSNorm alone should change outputs, but max|Δ| = {delta_norm}"
+    print(f"✅ RMSNormRotated alone changes block outputs (max|Δ| = {delta_norm})")
+    del llm_norm
+    torch.cuda.empty_cache()
+
+    # rotation only should break reversibility
+    llm_rot_only = copy.deepcopy(llm.cpu()).eval().to(device)
+    _rotate_model_parameters_with_R(llm_rot_only, R)
+    y_rot_only = llm_rot_only.model.layers[0](x @ R, attention_mask=mask,
+                                              position_ids=pos_ids,
+                                              position_embeddings=(cos, sin))[0]
+    y_unrot_only = y_rot_only @ R_t
+    delta_rot = (y_baseline - y_unrot_only).abs().max()
+    assert not torch.allclose(y_baseline, y_unrot_only, atol=1e-6), \
+        f"Rotation without replacing RMSNorm should break reversibility, but max|Δ| = {delta_rot}"
+    print(f"✅ Rotation without replacing RMSNorm breaks block reversibility (max|Δ| = {delta_rot})")
+    del llm_rot_only
+    torch.cuda.empty_cache()
+
+    # full rotation + RMSNormRotated should restore reversibility
+    llm_full = copy.deepcopy(llm.cpu()).eval().to(device)
+    _rotate_model_parameters_with_R(llm_full, R)
+    replace_rms_with_rotated(llm_full, R)
+    y_rot = llm_full.model.layers[0](x @ R, attention_mask=mask,
+                                     position_ids=pos_ids,
+                                     position_embeddings=(cos, sin))[0]
+    y_unrot = y_rot @ R_t
+    delta = (y_baseline - y_unrot).abs().max()
+    assert delta < 1e-3, f"Transformer block reversibility under R failed, max|Δ| = {delta}"
+    print(f"✅ Transformer block reversibility under R holds (max|Δ| = {delta})")
+    del llm_full
+    torch.cuda.empty_cache()
+    
+
 def test_model_reversibility():
     # Test that the full LlamaModel permuted under π can be un-permuted by πᵀ
     from transformers import LlamaConfig, LlamaForCausalLM
@@ -124,8 +204,63 @@ def test_model_reversibility():
     )
     print("✅ LlamaModel reversibility under π holds.")
 
+def test_block_reversibility_R_and_Delta():
+    cfg = LlamaConfig(hidden_size=16,
+                      intermediate_size=64,
+                      num_hidden_layers=1,
+                      num_attention_heads=4,
+                      vocab_size=100)
+    llm  = LlamaForCausalLM(cfg).eval()
+    block, rotary = llm.model.layers[0], llm.model.rotary_emb
+
+    # ---------- inject strong dense ΔW ----------------------------------
+    _add_dense_noise(llm, rho=0.30)
+
+    # ---------- baseline output -----------------------------------------
+    seq = 8
+    x   = torch.randn(1, seq, cfg.hidden_size)
+    mask = torch.full((1,1,seq,seq), float("-inf")).triu(1)
+    pos  = torch.arange(seq).unsqueeze(0)
+    cos, sin = rotary(x, pos)
+    y_base = block(x, attention_mask=mask,
+                   position_ids=pos,
+                   position_embeddings=(cos, sin))[0]
+
+    # ---------- build rotation & rotated model --------------------------
+    n_h     = cfg.num_attention_heads
+    h_dim   = cfg.hidden_size // n_h
+    R       = rope_preserving_R(n_h, h_dim, dtype=x.dtype, device=x.device)
+    llm2    = copy.deepcopy(llm).eval()          # already contains ΔW
+    _rotate_model_parameters_with_R(llm2, R)
+
+    block2  = llm2.model.layers[0]
+    x_rot   = x @ R
+    y_rot   = block2(x_rot, attention_mask=mask,
+                     position_ids=pos,
+                     position_embeddings=(cos, sin))[0]
+    y_unrot = y_rot @ R.T
+
+    assert torch.allclose(y_base, y_unrot, atol=3e-4), (
+        f"Mismatch: max|Δ| = {(y_base - y_unrot).abs().max()}"
+    )
+    print("✅  Reversibility with rotation R + dense ΔW holds.")
+
+
+def test_block_reversibility_R_real():
+    """
+    Run block reversibility under R on a real pretrained Llama model.
+    """
+    import torch
+    from utils import model as MODEL_NAME
+    from transformers import LlamaForCausalLM
+
+    # load model to GPU if available (deep-copies happen on CPU inside the block test)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    llm = LlamaForCausalLM.from_pretrained(
+        MODEL_NAME, torch_dtype=torch.float16, low_cpu_mem_usage=True
+    ).to(device).eval()
+    test_block_reversibility_R(llm)
+
 
 if __name__ == '__main__':
-    test_block_reversibility()
-    test_model_reversibility()
-    test_identity_permutation()
+    test_block_reversibility_R_real()
