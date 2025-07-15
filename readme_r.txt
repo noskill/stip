@@ -50,7 +50,45 @@ In compact form
 
  f′(h R) = f(h) R (12)
  
- 
+──────────────────────────── SwiGLU ──────────────────────────── 
+ Below is the short algebra that shows the feed-forward / SwiGLU block
+behaves exactly the same way as the attention block once every weight
+matrix has been rewritten with the rotation (or permutation) R.
+
+Notation – original model
+ x   : (batch,seq,d) hidden state that enters the MLP
+ W₁ , W₃ ∈ ℝ^{d×m}  gate-proj / up-proj
+ W₂  ∈ ℝ^{m×d}    down-proj
+ σ(·) : SiLU (≈ x · sigmoid x)
+ ⊙ : element-wise product
+
+ FFN(x) = ( (x W₁) · σ(x W₁) ⊙ (x W₃) ) W₂ 
+
+Transformation we apply once off-line
+
+ x′ = x R (2)
+ W₁′ = Rᵀ W₁ , W₃′ = Rᵀ W₃ , W₂′ = W₂ R 
+
+(the same rule we already use for q/k/v/o).
+
+Step-by-step inside the rotated model
+1 Gate / up projections
+ x′ W₁′ = (x R)(Rᵀ W₁) = x W₁
+ x′ W₃′ = (x R)(Rᵀ W₃) = x W₃ 
+
+ → the vectors that the non-linearities see are identical to the
+  baseline ones.
+
+2 SwiGLU non-linearity (SiLU + ⊙)
+ All operations are element-wise, so the result is the same tensor that
+ the baseline would produce:
+
+ g = (x W₁) · σ(x W₁) ⊙ (x W₃) 
+ g′ (x′ computed in rotated model) = g 
+
+3 Down projection
+ y′ = g′ W₂′ = g (W₂ R) = ( g W₂ ) R = y R (7)
+ 
  ──────────────────────────── RMS-Norm ───────────────────────
 
 inputs are left-multiplied by R, so we unrotate by multiplying by Rᵀ

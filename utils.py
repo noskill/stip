@@ -141,32 +141,37 @@ from torch import nn
 class RMSNormRotated(nn.Module):
     """
     RMSNorm that assumes its inputs are *already* right-multiplied by a
-    fixed orthogonal matrix R.  Implements
-
-        y  =  (x / rms(x)) · Rᵀ · diag(gamma) · R
+    fixed orthogonal matrix R. It uses mixed-precision to ensure stability.
     """
     def __init__(self, d, eps=1e-5, R=None):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d))     # γ
+        self.weight = nn.Parameter(torch.ones(d))  # γ
         assert R is not None and R.shape == (d, d)
         self.register_buffer("R", R, persistent=False)  # no grad
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # (B, S, d)
-        print('run rmsnorm')
-        var  = x.pow(2).mean(dim=-1, keepdim=True)
-        xhat = x * torch.rsqrt(var + self.eps)           # step (1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        # Cast to float32 for stable calculations
+        x_fp32 = x.to(torch.float32)
 
-        # step (2)  :  x̂ @ Rᵀ
-        x_unrot = torch.matmul(xhat.to(self.R.dtype), self.R.t())         # (B,S,d)
+        # (1) Calculate variance and normalize in float32
+        variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+        xhat_fp32 = x_fp32 * torch.rsqrt(variance + self.eps)
 
-        # element-wise γ
-        x_scaled = x_unrot * self.weight.to(device=x_unrot.device,
-                                           dtype=x_unrot.dtype)    # (B,S,d)
+        # (2) Un-rotate in float32
+        # Ensure R is also in float32 for the matmul
+        R_fp32 = self.R.to(torch.float32).to(x.device)
+        x_unrot_fp32 = torch.matmul(xhat_fp32, R_fp32.t())
 
-        # step (3)  :  back to R-space
-        y = torch.matmul(x_scaled, self.R).to(xhat.dtype)               # (B,S,d)
-        return y
+        # (3) Apply scaling gamma in float32
+        x_scaled_fp32 = x_unrot_fp32 * self.weight.to(torch.float32).to(x_unrot_fp32.device)
+
+        # (4) Re-rotate back to R-space in float32
+        y_fp32 = torch.matmul(x_scaled_fp32, R_fp32)
+
+        # (5) Cast back to the original dtype before returning
+        return y_fp32.to(input_dtype)
 
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
