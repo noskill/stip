@@ -136,7 +136,35 @@ def rope_preserving_R(n_heads: int, head_dim: int = 128,
             R[row:row + 2, row:row + 2] = rot2
     return R
 
-                
+
+def better_rope_preserving_R(n_heads: int,
+                      head_dim: int = 128,
+                      max_angle: float = 0.20,        # radians ≈ 11°
+                      dtype=torch.float32,
+                      device=None) -> torch.Tensor:
+    """
+    Same layout as your function but θ ∼ U(-max_angle, max_angle).
+    That keeps each feature within ≈ cos(11°)=0.98 correlation
+    with the original axis → quality drop is usually <0.5 pp.
+    """
+    import math, torch
+    if head_dim % 2:
+        raise ValueError("head_dim must be even")
+    d      = n_heads * head_dim
+    pairs  = head_dim // 2
+    R      = torch.zeros((d, d), dtype=torch.float32, device=device)
+    for h in range(n_heads):
+        base = h * head_dim
+        for j in range(pairs):
+            theta = (torch.rand(1, device=device) * 2 - 1) * max_angle
+            c, s  = torch.cos(theta), torch.sin(theta)
+            rot   = torch.stack((torch.cat([c, -s]),
+                                 torch.cat([s,  c])))
+            row   = base + 2 * j
+            R[row:row+2, row:row+2] = rot
+    return R.to(dtype)
+
+
 from torch import nn
 class RMSNormRotated(nn.Module):
     """
@@ -161,7 +189,7 @@ class RMSNormRotated(nn.Module):
 
         # (2) Un-rotate in float32
         # Ensure R is also in float32 for the matmul
-        R_fp32 = self.R.to(torch.float32).to(x.device)
+        R_fp32 = self.R.to(x.device)
         x_unrot_fp32 = torch.matmul(xhat_fp32, R_fp32.t())
 
         # (3) Apply scaling gamma in float32
@@ -177,7 +205,7 @@ from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 def replace_rms_with_rotated(model_obj, R):
     d = model_obj.config.hidden_size
-    R = R.to(model_obj.dtype).to(model_obj.device)
+    R = R.to(torch.float32).to(model_obj.device)
 
     for layer in model_obj.model.layers:
         for attr in ("input_layernorm", "post_attention_layernorm"):
@@ -210,12 +238,17 @@ def _rotate_model_parameters_with_R(model, R: torch.Tensor):
     R = R.to(torch.float32)                 # master
 
     emb  = model.model.embed_tokens.weight      # (V, d)
-    head = model.lm_head.weight                # (V, d)  tied
+    head = model.lm_head.weight                # (V, d) 
 
     with torch.no_grad():
+        untied = False
+        if head.data_ptr() != emb.data_ptr():
+            print('untied head')
+            untied = True
         # embeddings + lm_head
         emb .copy_((emb .float() @ R.to(emb .device)).to(emb .dtype))
-        head.copy_((head.float() @ R.to(head.device)).to(head.dtype))
+        if untied:
+            head.copy_((head.float() @ R.to(head.device)).to(head.dtype))
 
         # transformer blocks
         Rt_cpu = R.T
@@ -224,7 +257,7 @@ def _rotate_model_parameters_with_R(model, R: torch.Tensor):
             for proj in ("q_proj", "k_proj", "v_proj"):
                 w = getattr(layer.self_attn, proj).weight   # (d,d)
                 Rt = Rt_cpu.to(w.device)
-                w.copy_((Rt @ w.float() @ R.to(w.device)).to(w.dtype))
+                w.copy_((Rt @ w.float() @ R).to(w.dtype))
 
             w = layer.self_attn.o_proj.weight               # (d,d)
             Rt = Rt_cpu.to(w.device)
@@ -242,8 +275,6 @@ def _rotate_model_parameters_with_R(model, R: torch.Tensor):
             down.copy_((Rt @ down.float()).to(down.dtype))
 
 
-
-
 def get_model_R():
 
     tokenizer = AutoTokenizer.from_pretrained(model)
@@ -254,11 +285,12 @@ def get_model_R():
             torch_dtype=torch.float16,
     ).to(device)
 
-    # rho = 0.1
-    # print(f'adding noise {rho}')
+    rho = 0.1
+    print(f'adding noise {rho}')
     # _add_dense_noise(model_obj, rho)
+    
     cfg = model_obj.config
-    R    = rope_preserving_R(cfg.num_attention_heads,
+    R    = better_rope_preserving_R(cfg.num_attention_heads,
                             cfg.hidden_size // cfg.num_attention_heads,
                             dtype=torch.float32,
                             device=next(model_obj.parameters()).device)

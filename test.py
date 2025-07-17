@@ -92,7 +92,7 @@ def test_block_reversibility_R(llm):
     Test that a single Transformer block permutes reversibly under R for the given Llama model.
     Verifies RMSNorm-only change, rotation-only breakage, and full rotation+RMSNormRotated reversibility.
     """
-    from utils import _rotate_model_parameters_with_R, rope_preserving_R, replace_rms_with_rotated
+    from utils import _rotate_model_parameters_with_R, rope_preserving_R, replace_rms_with_rotated, better_rope_preserving_R
 
     llm = llm.eval()
     block, rotary = llm.model.layers[0], llm.model.rotary_emb
@@ -103,7 +103,7 @@ def test_block_reversibility_R(llm):
     # generate RoPE-preserving rotation
     n_heads = cfg.num_attention_heads
     head_dim = cfg.hidden_size // n_heads
-    R = rope_preserving_R(n_heads, head_dim, dtype=dtype, device=device)
+    R = better_rope_preserving_R(n_heads, head_dim, dtype=torch.float32, device=device)
     R_t = R.t()
 
     # dummy input
@@ -137,12 +137,13 @@ def test_block_reversibility_R(llm):
     # rotation only should break reversibility
     llm_rot_only = copy.deepcopy(llm.cpu()).eval().to(device)
     _rotate_model_parameters_with_R(llm_rot_only, R)
-    y_rot_only = llm_rot_only.model.layers[0](x @ R, attention_mask=mask,
+
+    y_rot_only = llm_rot_only.model.layers[0]((x.to(R) @ R).to(dtype), attention_mask=mask,
                                               position_ids=pos_ids,
                                               position_embeddings=(cos, sin))[0]
-    y_unrot_only = y_rot_only @ R_t
+    y_unrot_only = y_rot_only.to(R_t) @ R_t
     delta_rot = (y_baseline - y_unrot_only).abs().max()
-    assert not torch.allclose(y_baseline, y_unrot_only, atol=1e-6), \
+    assert not torch.allclose(y_baseline.to(torch.float32), y_unrot_only.to(torch.float32), atol=1e-6), \
         f"Rotation without replacing RMSNorm should break reversibility, but max|Δ| = {delta_rot}"
     print(f"✅ Rotation without replacing RMSNorm breaks block reversibility (max|Δ| = {delta_rot})")
     del llm_rot_only
@@ -152,10 +153,10 @@ def test_block_reversibility_R(llm):
     llm_full = copy.deepcopy(llm.cpu()).eval().to(device)
     _rotate_model_parameters_with_R(llm_full, R)
     replace_rms_with_rotated(llm_full, R)
-    y_rot = llm_full.model.layers[0](x @ R, attention_mask=mask,
+    y_rot = llm_full.model.layers[0]((x.to(R) @ R).to(dtype), attention_mask=mask,
                                      position_ids=pos_ids,
                                      position_embeddings=(cos, sin))[0]
-    y_unrot = y_rot @ R_t
+    y_unrot = y_rot.to(R_t) @ R_t
     delta = (y_baseline - y_unrot).abs().max()
     assert delta < 1e-3, f"Transformer block reversibility under R failed, max|Δ| = {delta}"
     print(f"✅ Transformer block reversibility under R holds (max|Δ| = {delta})")
@@ -259,6 +260,7 @@ def test_block_reversibility_R_real():
     llm = LlamaForCausalLM.from_pretrained(
         MODEL_NAME, torch_dtype=torch.float16, low_cpu_mem_usage=True
     ).to(device).eval()
+
     test_block_reversibility_R(llm)
 
 
