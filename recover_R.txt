@@ -1,0 +1,14 @@
+Start with the public Llama-2-7B checkpoint (d = 4096).
+
+Inside the TEE we generate a random orthogonal matrix R and create “masked” weights
+  W′ = Rᵀ (W + ΔW) R,
+where ΔW is chosen in three settings:
+• 0 % (no noise);
+• LoRA with r = 32, α = 16 (≈ 2 % of Frobenius norm);
+• dense Gaussian noise at 5 % of the Frobenius norm.
+The host receives the pairs (W, W′) for the four projection matrices (q, k, v, o) of three layers.
+On the host side we try to recover R*:
+  min_R Σ ‖W′_i − Rᵀ W_i R‖²_F , with R ∈ O(d)
+
+solved by gradient search (orthogonal Procrustes with re-projection).
+4. Success metric: average cosine similarity between the true R and the recovered R*; sim ≈ 1 ⇒ R is recovered.

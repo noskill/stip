@@ -21,6 +21,28 @@ def _add_dense_noise(model, rho: float = 0.30):
                 p.add_(g)
 
 
+def better_add_dense_noise(model, noise_ratio: float = 0.05, seed: int | None = None):
+    """
+    Добавляет к каждой двумерной матрице модели плотный гауссов шум.
+
+    noise_ratio:  относительная величина шума (0.05 ≈ 5 % Frobenius-нормы).
+    seed:         при необходимости фиксирует ГСЧ для воспроизводимости.
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    with torch.no_grad():
+        for W in model.parameters():
+            if W.ndim != 2:          # пропускаем векторы RMSNorm, bias и т.п.
+                continue
+
+            frob_norm = W.norm(p='fro')            # ‖W‖_F
+            n_elem    = W.numel()                  # m · n
+            sigma     = noise_ratio * frob_norm / n_elem**0.5
+            noise     = torch.randn_like(W) * sigma
+            W.add_(noise)  
+
+
 def _permute_model_parameters(model, pi):
     """In-place permute parameters of a Llama-based model according to a permutation matrix pi,
     following the transformations in readme.txt.
@@ -143,7 +165,7 @@ def better_rope_preserving_R(n_heads: int,
                       dtype=torch.float32,
                       device=None) -> torch.Tensor:
     """
-    Same layout as your function but θ ∼ U(-max_angle, max_angle).
+    Same layout as rope_preserving_R but θ ∼ U(-max_angle, max_angle).
     That keeps each feature within ≈ cos(11°)=0.98 correlation
     with the original axis → quality drop is usually <0.5 pp.
     """
@@ -286,8 +308,8 @@ def get_model_R():
     ).to(device)
 
     rho = 0.1
-    print(f'adding noise {rho}')
-    # _add_dense_noise(model_obj, rho)
+    # print(f'adding noise {rho}')
+    better_add_dense_noise(model_obj)
     
     cfg = model_obj.config
     R    = better_rope_preserving_R(cfg.num_attention_heads,
