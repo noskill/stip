@@ -1,4 +1,5 @@
 import torch
+from typing import Optional
 from transformers import AutoTokenizer
 import transformers
 import math
@@ -257,7 +258,8 @@ def _rotate_model_parameters_with_R(model, R: torch.Tensor):
     """
     d = model.config.hidden_size
     assert R.shape == (d, d)
-    R = R.to(torch.float32)                 # master
+    # Ensure R master is float32 on CPU for consistent per-weight dispatch
+    R_master = R.to(torch.float32).cpu()
 
     emb  = model.model.embed_tokens.weight      # (V, d)
     head = model.lm_head.weight                # (V, d) 
@@ -268,30 +270,30 @@ def _rotate_model_parameters_with_R(model, R: torch.Tensor):
             print('untied head')
             untied = True
         # embeddings + lm_head
-        emb .copy_((emb .float() @ R.to(emb .device)).to(emb .dtype))
+        emb.copy_((emb.float() @ R_master.to(emb.device)).to(emb.dtype))
         if untied:
-            head.copy_((head.float() @ R.to(head.device)).to(head.dtype))
+            head.copy_((head.float() @ R_master.to(head.device)).to(head.dtype))
 
         # transformer blocks
-        Rt_cpu = R.T
+        Rt_cpu = R_master.T
         for layer in model.model.layers:
             # self-attention (square)
             for proj in ("q_proj", "k_proj", "v_proj"):
                 w = getattr(layer.self_attn, proj).weight   # (d,d)
                 Rt = Rt_cpu.to(w.device)
-                w.copy_((Rt @ w.float() @ R).to(w.dtype))
+                w.copy_((Rt @ w.float() @ R_master.to(w.device)).to(w.dtype))
 
             w = layer.self_attn.o_proj.weight               # (d,d)
             Rt = Rt_cpu.to(w.device)
-            w.copy_((Rt @ w.float() @ R.to(w.device)).to(w.dtype))
+            w.copy_((Rt @ w.float() @ R_master.to(w.device)).to(w.dtype))
 
             # MLP (rectangular)
             up   = layer.mlp.up_proj.weight     # (11008 , 4096)
             gate = layer.mlp.gate_proj.weight   # (11008 , 4096)
             down = layer.mlp.down_proj.weight   # ( 4096 , 11008)
 
-            up  .copy_((up  .float() @ R.to(up  .device)).to(up  .dtype))
-            gate.copy_((gate.float() @ R.to(gate.device)).to(gate.dtype))
+            up.copy_((up.float() @ R_master.to(up.device)).to(up.dtype))
+            gate.copy_((gate.float() @ R_master.to(gate.device)).to(gate.dtype))
 
             Rt = Rt_cpu.to(down.device)
             down.copy_((Rt @ down.float()).to(down.dtype))
@@ -314,6 +316,7 @@ def get_model_R():
     cfg = model_obj.config
     R    = better_rope_preserving_R(cfg.num_attention_heads,
                             cfg.hidden_size // cfg.num_attention_heads,
+                            max_angle=0.8,
                             dtype=torch.float32,
                             device=next(model_obj.parameters()).device)
     _rotate_model_parameters_with_R(model_obj, R)
@@ -357,3 +360,47 @@ def get_model_pi(pi):
     )
     return pipeline
 
+
+
+def dense_orthogonal_R(
+    d: int,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: Optional[torch.device | str] = None,
+    seed: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Generates a random orthogonal matrix R size D × D.
+    
+    • The matrix is dense: each dimension is mixed with everyone else.
+    • No structure of “pairing coordinates” (as in Rope) is preserved.
+    • DET (R) = +1, i.e. Belongs SO (D).
+    
+    Parameters
+    ----------
+    D: Dimension of hidden space (for example, 4096 for LLAMA-2-13B).
+    Dtype: Torch.float32 | Torch.float16 | ...
+    Device: "Cuda", "Cuda: 1", "CPU", etc.
+    SEED: if necessary, fixes the generator of random numbers.
+    
+    Returns
+    ----------
+    R: torch.tensor shape (d, d), orthogonal (r @ r.t == i).
+        """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    # 1. random Gaussian matrix
+    g = torch.randn(d, d, dtype=dtype, device=device)
+
+    # 2. QR-decomposition  (g = Q R)
+    #    Q – orthonormal, R – upper triangular
+    q, r = torch.linalg.qr(g, mode='reduced')
+
+    # 3. make det(Q) = +1
+    #    (multiply each column Q by diagonal element of R)
+    diag = torch.diagonal(r)
+    phase = diag.sign()
+    q *= phase
+
+    return q
