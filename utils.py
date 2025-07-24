@@ -243,6 +243,116 @@ def replace_rms_with_rotated(model_obj, R):
     model_obj.model.norm.weight.data.copy_(old_top.weight.data)
 
 
+from transformers.models.llama.modeling_llama import LlamaAttention, LlamaConfig, Cache, Unpack, FlashAttentionKwargs, apply_rotary_pos_emb, eager_attention_forward, ALL_ATTENTION_FUNCTIONS
+
+
+class MyAttn(LlamaAttention):
+    def __init__(self, config, layer_idx, R: torch.Tensor):
+        super().__init__(config, layer_idx)
+        self.register_buffer("R", R)               # [d, d]
+        self.num_attention_heads = self.config.num_attention_heads
+        self.head_dim = self.config.head_dim
+
+    # ⬇ helper – быстрее, чем torch.matmul 2-D-к-3-D
+    def _mm(self, x, M):
+        dtype = x.dtype
+        return (x.float() @ M).to(dtype)                               # (B,S,d)·(d,d)
+
+    def forward(
+        self,
+        hidden_states,                # (B,S,d)           уже содержит R
+        position_embeddings,          # (cos, sin)
+        attention_mask=None,
+        past_key_value=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        B, S, _ = hidden_states.shape
+        d      = self.config.hidden_size
+
+        # 1) линейные проекции (все ещё в «R-пространстве»)
+        q = self.q_proj(hidden_states)             # (B,S,d)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)             # v оставляем как есть
+
+        # 2) ОТМЕНЯЕМ вращение ────────────  (B,S,d)
+        q = self._mm(q, self.R.T)                  # q  ← q · Rᵀ
+        k = self._mm(k, self.R.T)                  # k  ← k · Rᵀ
+
+        # 3) в головы
+        q = q.view(B, S, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, S, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, S, self.num_attention_heads, self.head_dim).transpose(1, 2)
+
+        # 4) RoPE на «правильных» координатах
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        # 5) обратно в [B,S,d] и СНОВА вращаем  R
+        q = q.transpose(1, 2).contiguous().view(B, S, d)
+        k = k.transpose(1, 2).contiguous().view(B, S, d)
+        q = self._mm(q, self.R)                    # q  ← q · R
+        k = self._mm(k, self.R)                    # k  ← k · R
+        # v уже в R-пространстве, менять не нужно
+
+        # 6) дальше обычный attention
+        q = q.view(B, S, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, S, self.num_attention_heads, self.head_dim).transpose(1, 2)
+
+        attention_fn = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        attn_output, attn_weights = attention_fn(
+            self,
+            q, k, v,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(B, S, d).contiguous()
+        attn_output = self.o_proj(attn_output)     # o_proj уже повернут оф-лайн
+        return attn_output, attn_weights
+    
+
+def replace_attention_RoPE_dense(model_obj, R):
+    for layer in model_obj.model.layers:
+
+        old_attn = getattr(layer, 'self_attn', None)
+        if old_attn is None:
+            return
+        with torch.no_grad():    
+            new_attn = MyAttn(
+                old_attn.config,
+                getattr(old_attn, "layer_idx", 0),
+                R
+            ).to(old_attn.q_proj.weight.device, old_attn.q_proj.weight.dtype)
+            
+
+            # 2. копируем веса; bias может отсутствовать
+            new_attn.q_proj.weight.copy_(old_attn.q_proj.weight)
+            new_attn.k_proj.weight.copy_(old_attn.k_proj.weight)
+            new_attn.v_proj.weight.copy_(old_attn.v_proj.weight)
+            new_attn.o_proj.weight.copy_(old_attn.o_proj.weight)
+
+            if old_attn.q_proj.bias is not None:
+                new_attn.q_proj.bias.copy_(old_attn.q_proj.bias)
+                new_attn.k_proj.bias.copy_(old_attn.k_proj.bias)
+                new_attn.v_proj.bias.copy_(old_attn.v_proj.bias)
+                new_attn.o_proj.bias.copy_(old_attn.o_proj.bias)
+
+            # 3. если в MyAttn есть rotary_emb или другие буферы — скопируем
+            for name, buf in old_attn.named_buffers():
+                if name in dict(new_attn.named_buffers()):
+                    getattr(new_attn, name).copy_(buf)
+
+            # 4. подменяем в слое
+            layer.self_attn = new_attn
+            new_attn.R = R
+    return model_obj
+
 # -------------------------------------------------------------------------
 # 2.  In-place rotation of *all* parameters that live in ℝd
 # -------------------------------------------------------------------------
@@ -267,7 +377,6 @@ def _rotate_model_parameters_with_R(model, R: torch.Tensor):
     with torch.no_grad():
         untied = False
         if head.data_ptr() != emb.data_ptr():
-            print('untied head')
             untied = True
         # embeddings + lm_head
         emb.copy_((emb.float() @ R_master.to(emb.device)).to(emb.dtype))
@@ -299,8 +408,38 @@ def _rotate_model_parameters_with_R(model, R: torch.Tensor):
             down.copy_((Rt @ down.float()).to(down.dtype))
 
 
-def get_model_R():
+def get_model_R_dense():
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    # load model on a single device in half precision
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model_obj = LlamaForCausalLM.from_pretrained(
+            model,
+            torch_dtype=torch.float16,
+    ).to(device)
 
+    
+    cfg = model_obj.config
+    R    = dense_orthogonal_R(cfg.hidden_size,
+                            dtype=torch.float32,
+                            device=next(model_obj.parameters()).device)
+    _rotate_model_parameters_with_R(model_obj, R)
+    replace_rms_with_rotated(model_obj, R)
+    replace_attention_RoPE_dense(model_obj, R)
+    model_obj.to(device)
+    
+    # build a text-generation pipeline on the same device
+    device_id = device.index if device.type == "cuda" else -1
+    pipeline = transformers.pipeline(
+        "text-generation",
+        model=model_obj,
+        tokenizer=tokenizer,
+        torch_dtype=torch.float16,
+        device=device_id,
+    )
+    return pipeline
+
+
+def get_model_R():
     tokenizer = AutoTokenizer.from_pretrained(model)
     # load model on a single device in half precision
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
