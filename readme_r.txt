@@ -12,9 +12,23 @@ and rotate every activation that leaves / enters the un-trusted GPUs
  h′ = h R. (2)
  
  
- 
- ──────────────────────────── Attention with rotation ───────────────────────
+Pytorch linear layer implements stores internally Wᵀ and implements y = xW + b 
 
+as
+
+y = x(Wᵀ)ᵀ + b
+given that 
+(ABC)ᵀ = Bᵀ AᵀCᵀ
+
+in derivation we have
+W` = Rᵀ·W·R
+then W`ᵀ = (Rᵀ·W·R)ᵀ = Rᵀ Wᵀ (Rᵀ)ᵀ =  Rᵀ Wᵀ R
+
+update in code:
+weight = Rᵀ @ weight @ R
+
+
+ ──────────────────────────── Attention with rotation ───────────────────────
 Queries:
 Q′ = h′Wq′ = (h R) (Rᵀ Wq R) = h Wq R = Q R (3)
 
@@ -103,4 +117,32 @@ then rotate with R again:
 
 y′ = yR
 
+───────────────────────────── RoPE ─────────────────────────────
+
+The rotation matrix R can be chosen in two flavours:
+
+1. RoPE–compatible R (block 2 × 2 inside every head)
+    • keeps the (x0 , x1), (x2 , x3)… pairs that Rotary Positional
+    Embedding expects;
+    • RoPE can run on the un-trusted GPUs exactly where it was in the
+    original model;
+    • drawback – R is easy to recover (row / Procrustes attack).
+2. RoPE–incompatible R (dense, mixes coordinates across heads)
+    • maximises secrecy: recovering R from W and W′ is practically
+    impossible;
+    • RoPE must then be executed inside the TEE, because outside GPUs see
+    vectors already rotated by R and the original “pair” assumption is
+    gone.
+    Both variants keep the algebra of the main README intact; only the place
+    where RoPE is applied changes.
+    
+in this case addition transformation from R space back to original space is needed:
+GPU side (R-space)              TEE side
+
+q′ = (h R) @ (Rᵀ Wq R) …  ─────▶  q = q′ Rᵀ
+k = k′ Rᵀ
+(q,k) = apply_rotary_pos_emb(q,k)
+q′ = q R
+k′ = k R  ─────▶ back to GPU
+softmax(q′ k′ᵀ /√d) …
 
