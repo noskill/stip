@@ -18,7 +18,7 @@ as
 
 y = x(Wᵀ)ᵀ + b
 given that 
-(ABC)ᵀ = Bᵀ AᵀCᵀ
+(A·B·C)ᵀ = Bᵀ·Aᵀ·Cᵀ
 
 in derivation we have
 W` = Rᵀ·W·R

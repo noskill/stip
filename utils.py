@@ -255,8 +255,9 @@ class MyAttn(LlamaAttention):
 
     # ⬇ helper – быстрее, чем torch.matmul 2-D-к-3-D
     def _mm(self, x, M):
-        dtype = x.dtype
-        return (x.float() @ M).to(dtype)                               # (B,S,d)·(d,d)
+        # Batched matrix-multiply and cast back to original dtype.
+        # Preserve higher precision if x is float64 or lower if float32/16.
+        return (x.to(M.dtype) @ M).to(x.dtype)
 
     def forward(
         self,
@@ -267,37 +268,55 @@ class MyAttn(LlamaAttention):
         cache_position=None,
         **kwargs,
     ):
+        #return super().forward(hidden_states,  position_embeddings, attention_mask=attention_mask,
+        # past_key_value=past_key_value,
+        # cache_position=cache_position,
+        # **kwargs)
+        
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
         B, S, _ = hidden_states.shape
         d      = self.config.hidden_size
 
-        # 1) линейные проекции (все ещё в «R-пространстве»)
+        # 1) linear projection still in  R-space
         q = self.q_proj(hidden_states)             # (B,S,d)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)             # v оставляем как есть
 
-        # 2) ОТМЕНЯЕМ вращение ────────────  (B,S,d)
-        q = self._mm(q, self.R.T)                  # q  ← q · Rᵀ
-        k = self._mm(k, self.R.T)                  # k  ← k · Rᵀ
+        # 2) revert R               (B,S,d)
+        q = self._mm(q, self.R.T)       #           q′ = (h R) @ (Rᵀ Wq R) …  ─────▶  q = q′ Rᵀ
+        k = self._mm(k, self.R.T)         #           k = k′ Rᵀ
+        
+        qshape = q.shape
+        kshape = k.shape
 
-        # 3) в головы
-        q = q.view(B, S, self.num_attention_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, S, self.num_attention_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, S, self.num_attention_heads, self.head_dim).transpose(1, 2)
-
-        # 4) RoPE на «правильных» координатах
+        # 3) attention heads
+        q = q.view(hidden_shape).transpose(1, 2)  # B, S, num_attention_heads, head_dim
+        k = k.view(hidden_shape).transpose(1, 2)
+        v = v.view(hidden_shape).transpose(1, 2)
+ 
+        # 4) RoPE on un-rotated q/k, then update key/value cache if used
         cos, sin = position_embeddings
+        # 4) RoPE on un-rotated q/k
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # 5) обратно в [B,S,d] и СНОВА вращаем  R
+        # 5) merge heads and re-apply rotation R to q/k; v remains in R-space
         q = q.transpose(1, 2).contiguous().view(B, S, d)
-        k = k.transpose(1, 2).contiguous().view(B, S, d)
-        q = self._mm(q, self.R)                    # q  ← q · R
-        k = self._mm(k, self.R)                    # k  ← k · R
-        # v уже в R-пространстве, менять не нужно
+        _, _, k_seq, _ = k.size()
+        k = k.transpose(1, 2).contiguous().view(B, k_seq, d)
+        # rotate again
+        q = self._mm(q, self.R)                  # q` ← q · R
+        k = self._mm(k, self.R)                  # k`  ← k · R
 
-        # 6) дальше обычный attention
-        q = q.view(B, S, self.num_attention_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, S, self.num_attention_heads, self.head_dim).transpose(1, 2)
+        # 6) update KV cache (key may grow beyond current S)
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            k, v = past_key_value.update(k, v, self.layer_idx, cache_kwargs)
+
+        # 7) proceed with usual attention over heads
+        q = q.view(hidden_shape).transpose(1, 2)
+        _, k_seq, _ = k.size()
+        k = k.view((B, k_seq, -1, self.head_dim)).transpose(1, 2)
 
         attention_fn = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -353,6 +372,7 @@ def replace_attention_RoPE_dense(model_obj, R):
             new_attn.R = R
     return model_obj
 
+
 # -------------------------------------------------------------------------
 # 2.  In-place rotation of *all* parameters that live in ℝd
 # -------------------------------------------------------------------------
@@ -375,6 +395,14 @@ def _rotate_model_parameters_with_R(model, R: torch.Tensor):
     head = model.lm_head.weight                # (V, d) 
 
     with torch.no_grad():
+        # ensure no biases in linear projections for rotation invariance
+        for layer in model.model.layers:
+            for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                bias = getattr(layer.self_attn, proj).bias
+                assert bias is None, f"Expected no bias in self_attn.{proj}, but got {bias}"
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                bias = getattr(layer.mlp, proj).bias
+                assert bias is None, f"Expected no bias in mlp.{proj}, but got {bias}"
         untied = False
         if head.data_ptr() != emb.data_ptr():
             untied = True
@@ -393,7 +421,6 @@ def _rotate_model_parameters_with_R(model, R: torch.Tensor):
                 w.copy_((Rt @ w.float() @ R_master.to(w.device)).to(w.dtype))
 
             w = layer.self_attn.o_proj.weight               # (d,d)
-            Rt = Rt_cpu.to(w.device)
             w.copy_((Rt @ w.float() @ R_master.to(w.device)).to(w.dtype))
 
             # MLP (rectangular)
@@ -401,10 +428,14 @@ def _rotate_model_parameters_with_R(model, R: torch.Tensor):
             gate = layer.mlp.gate_proj.weight   # (11008 , 4096)
             down = layer.mlp.down_proj.weight   # ( 4096 , 11008)
 
+            # (A·B·C)ᵀ = Bᵀ·Aᵀ·Cᵀ
+            # W₁` = (Rᵀ W₁)
+            # W₁ᵀ = (Rᵀ W₁)ᵀ =W₁ᵀRᵀᵀ = W₁ᵀR  
             up.copy_((up.float() @ R_master.to(up.device)).to(up.dtype))
             gate.copy_((gate.float() @ R_master.to(gate.device)).to(gate.dtype))
 
             Rt = Rt_cpu.to(down.device)
+            # W₂′ = W₂ R 
             down.copy_((Rt @ down.float()).to(down.dtype))
 
 
@@ -422,6 +453,14 @@ def get_model_R_dense():
     R    = dense_orthogonal_R(cfg.hidden_size,
                             dtype=torch.float32,
                             device=next(model_obj.parameters()).device)
+
+#    R = torch.eye(cfg.hidden_size)
+#    R    = better_rope_preserving_R(cfg.num_attention_heads,
+#                            cfg.hidden_size // cfg.num_attention_heads,
+#                            max_angle=0.8,
+#                            dtype=torch.float32,
+#                            device=next(model_obj.parameters()).device)
+#
     _rotate_model_parameters_with_R(model_obj, R)
     replace_rms_with_rotated(model_obj, R)
     replace_attention_RoPE_dense(model_obj, R)
