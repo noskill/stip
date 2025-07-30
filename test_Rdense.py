@@ -1,4 +1,5 @@
 
+import gc
 import copy
 
 import torch
@@ -127,27 +128,26 @@ def test_block_reversability():
 
 def test_full_forward_invariance_dense():
     # First run on a mini Llama to get quick feedback
+    # Mini-model invariance for quick feedback; deep-copy for isolation
     mini_cfg = LlamaConfig(hidden_size=32,
                            intermediate_size=64,
                            num_hidden_layers=1,
                            num_attention_heads=4,
                            vocab_size=100)
-    mini_base = LlamaForCausalLM(mini_cfg).eval()
+    mini_template = LlamaForCausalLM(mini_cfg).eval()
     d0 = mini_cfg.hidden_size
-
-    R0 = torch.eye(d0, dtype=torch.float32)
-    print("=== Full-forward invariance (mini model): identity R ===")
-    test_full_forward_invariance_dense_impl(mini_base, R0)
-
-    perm0 = torch.randperm(d0)
-    R0_perm = torch.eye(d0, dtype=torch.float32)[perm0]
-    print("=== Full-forward invariance (mini model): permutation R ===")
-    test_full_forward_invariance_dense_impl(mini_base, R0_perm)
-
-    R0_dense = dense_orthogonal_R(d0, dtype=torch.float32, device='cpu', seed=0)
-    print("=== Full-forward invariance (mini model): dense random R ===")
-    test_full_forward_invariance_dense_impl(mini_base, R0_dense)
-
+    for R_small, label in [
+        (torch.eye(d0), "identity R"),
+        (torch.eye(d0)[torch.randperm(d0)], "permutation R"),
+        (dense_orthogonal_R(d0, dtype=torch.float32, device='cpu', seed=0), "dense random R"),
+    ]:
+        print(f"=== Full-forward invariance (mini model): {label} ===")
+        mini_base = copy.deepcopy(mini_template)
+        test_full_forward_invariance_dense_impl(mini_base, R_small)
+        del mini_base
+        gc.collect()
+    del mini_template, mini_cfg
+    gc.collect()
     # Then run on the full pretrained model on CPU
     cfg = AutoConfig.from_pretrained(MODEL_NAME)
     d = cfg.hidden_size
@@ -158,14 +158,29 @@ def test_full_forward_invariance_dense():
     print("=== Full-forward invariance: identity R ===")
     test_full_forward_invariance_dense_impl(base, R_id)
 
+
     perm = torch.randperm(d)
     R_perm = torch.eye(d, dtype=torch.float32, device=device)[perm]
     print("=== Full-forward invariance: permutation R ===")
+    base = LlamaForCausalLM.from_pretrained(MODEL_NAME).eval().to('cpu')
     test_full_forward_invariance_dense_impl(base, R_perm)
 
     R_dense = dense_orthogonal_R(d, dtype=torch.float32, device=device, seed=0)
-    print("=== Full-forward invariance: dense random R ===")
+    print("=== Full-forward invariance: dense random R (CPU) ===")
+    base = LlamaForCausalLM.from_pretrained(MODEL_NAME).eval().to('cpu')
     test_full_forward_invariance_dense_impl(base, R_dense)
+
+    # Additional check under bfloat16 on CUDA for dense R
+    if torch.cuda.is_available():
+        print("=== Full-forward invariance: dense random R (CUDA, bfloat16) ===")
+        base_bf16 = LlamaForCausalLM.from_pretrained(
+            MODEL_NAME,
+            torch_dtype=torch.bfloat16,
+        ).eval().to('cuda')
+        test_full_forward_invariance_dense_impl(base_bf16, R_dense.to('cuda'))
+        del base_bf16, base
+        gc.collect()
+
 
 def test_hidden_invariance_dense():
     # First run on a mini Llama for quick feedback
@@ -190,6 +205,10 @@ def test_hidden_invariance_dense():
     print("=== Hidden-state invariance (mini model): dense random R ===")
     test_hidden_invariance_dense_impl(mini_base, R0_dense)
 
+    # free mini-model resources to reduce peak memory
+    del mini_base, mini_cfg, R0, R0_perm, R0_dense, perm0
+    import gc; gc.collect()
+
     # Then run on the full pretrained model on CPU
     cfg = AutoConfig.from_pretrained(MODEL_NAME)
     d = cfg.hidden_size
@@ -199,15 +218,25 @@ def test_hidden_invariance_dense():
     R_id = torch.eye(d, dtype=torch.float32, device=device)
     print("=== Hidden-state invariance: identity R ===")
     test_hidden_invariance_dense_impl(base, R_id)
+    del base
 
     perm = torch.randperm(d)
     R_perm = torch.eye(d, dtype=torch.float32, device=device)[perm]
     print("=== Hidden-state invariance: permutation R ===")
+    base = LlamaForCausalLM.from_pretrained(MODEL_NAME).eval().to('cpu')
     test_hidden_invariance_dense_impl(base, R_perm)
 
     R_dense = dense_orthogonal_R(d, dtype=torch.float32, device=device, seed=0)
-    print("=== Hidden-state invariance: dense random R ===")
+    print("=== Hidden-state invariance: dense random R (CPU) ===")
+    base = LlamaForCausalLM.from_pretrained(MODEL_NAME).eval().to('cpu')
     test_hidden_invariance_dense_impl(base, R_dense)
+
+    # Additional check under bfloat16 on CPU for dense R
+    print("=== Hidden-state invariance: dense random R (CPU, bfloat16) ===")
+    base_bf16 = LlamaForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16).eval().to('cpu')
+    test_hidden_invariance_dense_impl(base_bf16, R_dense)
+    del base_bf16, base
+    gc.collect()
 
 def test_toy_block_reversibility_fp64():
     # Toy block-level reversibility in double precision to debug numeric drift
@@ -251,29 +280,58 @@ def test_full_forward_invariance_dense_impl(base, R):
     Compute and print max difference in next-token logits between base and R-rotated model
     under float32 and bfloat16 evaluations.
     """
-    rot = copy.deepcopy(base)
+    # Create dummy token IDs fitting the model's vocab (batch=1, seq_len=5)
+    device = next(base.parameters()).device
+    vocab_size = base.config.vocab_size
+    input_ids = torch.randint(vocab_size, (1, 5), dtype=torch.long, device=device)
+
+
+    # CPU bfloat16 baseline via autocast
+    device_cpu = next(base.parameters()).device
+    with torch.no_grad(), torch.amp.autocast(device_cpu.type, dtype=torch.bfloat16):
+        logits_base_bf16 = base(input_ids).logits[:, -1, :].float()
+    # cross-check that CUDA bfloat16 produces the same baseline if available
+    if torch.cuda.is_available():
+        # move model to CUDA in-place (bfloat16), run forward, then move back to CPU float32
+        base = base.to('cuda', torch.bfloat16)
+        input_ids_cuda = input_ids.to('cuda')
+        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            logits_base_cuda = base(input_ids_cuda).logits[:, -1, :].float()
+        # compare bfloat16 logits on CPU to avoid cross-device ops
+        a = logits_base_bf16.cpu()
+        b = logits_base_cuda.cpu()
+        diff_cuda = (a - b).abs().max().item()
+        print(f"  CPU vs CUDA bfloat16 baseline max diff = {diff_cuda:.3e}")
+        base = base.to(device_cpu).to(torch.float32)
+     
+    with torch.no_grad():
+        base32 = base.to(torch.float32)
+        logits_base32 = base32(input_ids).logits[:, -1, :].float()
+        del base32
+ 
+    # For mini model, deep-copy before rotating; for full model, rotate in-place to save memory
+    if base.config.num_hidden_layers == 1:
+        rot = copy.deepcopy(base)
+    else:
+        rot = base
+    del base
     _rotate_model_parameters_with_R(rot, R)
     replace_rms_with_rotated(rot, R)
     replace_attention_RoPE_dense(rot, R)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    prompt = "def foo():"
-    device = next(base.parameters()).device
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
     # float32 evaluation
-    base32 = base.to(torch.float32)
     rot32 = rot.to(torch.float32)
     with torch.no_grad():
-        logits_base32 = base32(input_ids).logits[:, -1, :].float()
         logits_rot32 = rot32(input_ids).logits[:, -1, :].float()
+        del rot32
     diff32 = (logits_base32 - logits_rot32).abs().max().item()
+    import gc
+    gc.collect()
 
-    # bfloat16 evaluation
-    base_bf16 = base.to(torch.bfloat16)
-    rot_bf16 = rot.to(torch.bfloat16)
-    with torch.no_grad():
-        logits_base_bf16 = base_bf16(input_ids).logits[:, -1, :].float()
-        logits_rot_bf16 = rot_bf16(input_ids).logits[:, -1, :].float()
+    # bfloat16 evaluation via autocast on the same device
+    device_type = device_cpu.type
+    with torch.no_grad(), torch.amp.autocast(device_type, dtype=torch.bfloat16):
+        logits_rot_bf16 = rot(input_ids).logits[:, -1, :].float()
     diff_bf16 = (logits_base_bf16 - logits_rot_bf16).abs().max().item()
 
     print(f"  Full-forward max diff (float32)={diff32:.3e}, (bfloat16)={diff_bf16:.3e}")
@@ -283,14 +341,18 @@ def test_hidden_invariance_dense_impl(base, R):
     Compute and print max difference in final hidden states between base and R-rotated model
     under float32 and bfloat16 evaluations.
     """
-    rot = copy.deepcopy(base)
+    # For mini model, deep-copy before rotating; for full model, rotate in-place to save memory
+    if base.config.num_hidden_layers == 1:
+        rot = copy.deepcopy(base)
+    else:
+        rot = base
     _rotate_model_parameters_with_R(rot, R)
     replace_rms_with_rotated(rot, R)
     replace_attention_RoPE_dense(rot, R)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    prompt = "def foo():"
+    # Create dummy token IDs fitting the model's vocab (batch=1, seq_len=5)
     device = next(base.parameters()).device
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    vocab_size = base.config.vocab_size
+    input_ids = torch.randint(vocab_size, (1, 5), dtype=torch.long, device=device)
 
     # float32 evaluation
     base32 = base.to(torch.float32)
@@ -303,16 +365,18 @@ def test_hidden_invariance_dense_impl(base, R):
     h_unrot32 = h_rot32 @ R.t()
     diff32 = (h_base32 - h_unrot32).abs().max().item()
 
-    # bfloat16 evaluation
-    base_bf16 = base.to(torch.bfloat16)
-    rot_bf16 = rot.to(torch.bfloat16)
-    with torch.no_grad():
-        out_base_bf16 = base_bf16(input_ids, output_hidden_states=True)
+    # bfloat16 evaluation via autocast on the same device
+    device_cpu = next(base.parameters()).device
+    device_type = device_cpu.type
+    with torch.no_grad(), torch.amp.autocast(device_type, dtype=torch.bfloat16):
+        out_base_bf16 = base(input_ids, output_hidden_states=True)
         h_base_bf16 = out_base_bf16.hidden_states[-1].float()
-        out_rot_bf16 = rot_bf16(input_ids, output_hidden_states=True)
+        out_rot_bf16 = rot(input_ids, output_hidden_states=True)
         h_rot_bf16 = out_rot_bf16.hidden_states[-1].float()
-    h_unrot_bf16 = h_rot_bf16 @ R.t()
-    diff_bf16 = (h_base_bf16 - h_unrot_bf16).abs().max().item()
+    # compare on CPU to avoid cross-device ops
+    a_h = h_base_bf16.cpu()
+    b_h = h_rot_bf16.cpu() @ R.t().cpu()
+    diff_bf16 = (a_h - b_h).abs().max().item()
 
     print(f"  Hidden-state max diff (float32)={diff32:.3e}, (bfloat16)={diff_bf16:.3e}")
 

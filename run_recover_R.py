@@ -15,7 +15,7 @@ import torch.optim
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from utils import better_add_dense_noise, better_rope_preserving_R, _rotate_model_parameters_with_R
-from utils import dense_orthogonal_R
+from utils import dense_orthogonal_R, rope_incompatible_head_R
 
 
 def parse_args():
@@ -81,17 +81,24 @@ def main():
         torch.manual_seed(args.seed)
 
     # Add dense Gaussian noise ΔW to all 2D weights (will affect selected layer among others)
-    # better_add_dense_noise(model, noise_ratio=args.noise_ratio)
+    better_add_dense_noise(model, noise_ratio=args.noise_ratio)
 
     # Build a block-diagonal orthogonal R preserving RoPE pairs
     head_dim = config.hidden_size // config.num_attention_heads
-    R = better_rope_preserving_R(
+    R = rope_incompatible_head_R(
         config.num_attention_heads,
-        head_dim,
-        max_angle=1.0,
+        head_dim=head_dim,
         dtype=torch.float32,
         device=device,
     )
+
+    # R = better_rope_preserving_R(
+    #     config.num_attention_heads,
+    #     head_dim,
+    #     max_angle=1.0,
+    #     dtype=torch.float32,
+    #     device=device,
+    # )
 #    R = dense_orthogonal_R(model.config.hidden_size, dtype=torch.float32, device="cuda", seed=42)
 
     # Apply rotation to all model weights in-place

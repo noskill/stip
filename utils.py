@@ -224,6 +224,67 @@ class RMSNormRotated(nn.Module):
         # (5) Cast back to the original dtype before returning
         return y_fp32.to(input_dtype)
 
+
+
+
+def rope_incompatible_head_R(
+    n_heads: int,
+    head_dim: int = 128,
+    *,
+    dtype: torch.dtype = torch.float32,
+    device: Optional[torch.device | str] = None,
+    seed: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Return a *head-local* but *RoPE-incompatible* orthogonal matrix R ∈ SO(d).
+
+    •  “head-local”:  R is block-diagonal with one head_dim×head_dim block
+       per attention head.  Nothing is mixed across heads, so you can still
+       `view(b,s,n_heads,head_dim)` without breaking shapes.
+
+    •  “RoPE-incompatible”:  inside every head we use a dense orthogonal
+       matrix (QR of a Gaussian) instead of independent 2×2 rotations, so
+       the original (x0,x1), (x2,x3) pairs are not preserved.
+
+    Parameters
+    ----------
+    n_heads : number of attention heads.
+    head_dim: hidden width per head (must be even for Llama-style models).
+    dtype   : result dtype (default fp32, change to fp16/fp64 if needed).
+    device  : torch.device or "cuda", "cpu", etc.
+    seed    : optional RNG seed for deterministic output.
+
+    Returns
+    -------
+    R : torch.Tensor of shape (d, d) where d = n_heads * head_dim.
+        R is orthogonal (R @ R.T == I) and det(R) = +1.
+    """
+    if head_dim % 2:
+        raise ValueError("head_dim must be even (got %d)" % head_dim)
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    d = n_heads * head_dim
+    R = torch.zeros((d, d), dtype=dtype, device=device)
+
+    for h in range(n_heads):
+        # 1.  Random Gaussian block, cast to float32 for numerical stability
+        g = torch.randn(head_dim, head_dim, device=device, dtype=torch.float32)
+
+        # 2.  QR → orthogonal matrix q  (g = q r)
+        q, _ = torch.linalg.qr(g)
+
+        # 3.  Make determinant +1  (q in SO(d), not O(d))
+        if torch.linalg.det(q) < 0:
+            q[:, 0] = -q[:, 0]
+
+        # 4.  Insert the block on the diagonal
+        base = h * head_dim
+        R[base : base + head_dim, base : base + head_dim] = q.to(dtype)
+
+    return R
+
+
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
 def replace_rms_with_rotated(model_obj, R):
