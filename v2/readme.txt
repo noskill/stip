@@ -58,4 +58,49 @@ Residual h_out = h + O
 
 ─────────────────────── end ───────────────────────
 
+Below is a back-of-the-envelope breakdown of how much compute (FLOPs) lands in the                          [190/1981]
+TEE vs. on the un-trusted accelerator for CodeLlama-7B when processing a single prompt                                
+of length L ∈ {8, 16, 32, 64, 128, 256, 512} tokens.                                                                  
+                                                                                                                      
+Assumptions                                                                                                           
+• CodeLlama-7B: 32 decoder layers, hidden = 4096, heads = 32, head-dim = 128, FFN dim = 11                            
+008.                                                                                          
+• 1 multiply-add = 2 FLOPs.                                                                                           
+• Only „big“ ops counted (layer norms, bias adds, activations, etc. ignored).                                         
+• TEE executes every operation except the two matrix multiplications inside                                           
+  the attention soft-max block (Q Kᵀ and A V). Those two go to the un-trusted device.                                 
+                                                                                                                      
+Per-layer FLOPs                                                                     
+                                                                                                                      
+  TEE                                                                                                                 
+    • Q/K/V/O projections: 4 · 4096 × 4096  →  67 M FLOPs / token                                                     
+    • Feed-forward (gate, up, down): 3 · 4096 × 11 008  → 135 M FLOPs / token                                         
+    ⇒ 202 M FLOPs per token → 0.202 · L B FLOPs per layer                                                             
+                                                                                                                      
+  Un-trusted accelerator                                                                                              
+    • Q Kᵀ : 32 · L² · 128                                                                                            
+    • A V  : 32 · L² · 128                                                                                            
+    ⇒ 8 192 · L² FLOPs ≈ 0.008192 · L² B FLOPs per layer 
 
+When amount of compute is equal:
+TEE                     untrusted
+32 * 0.202 * L  = 32 * 0.008192 * L**2
+6.464 L =  0.262144 L**2
+0.262144 L**2 - 6.464 L =  0
+
+D = B**2 - 4a c
+D = 41.78329600000001
+
+L = 6.464 +- 6.464 / (2 * 0.262144) = 24.658203125000004
+
+
+            ┌───────  TEE  ──────────┐                       ┌──── Un-trusted ──────────┐                     
+L (tokens)    6.464 · L  (B FLOPs)   |   Un-trusted / TEE    |   0.262144 · L² (B FLOPs)                          
+─────────   ─────────────────────────┼───────────────────────┼───────────────────────────                         
+    8                 51.7 B         |       0.04 ×          |     2.1 B                                     
+    16                103.4 B        |       0.16 ×          |     16.8 B                                     
+    32                206.9 B        |       1.30 ×          |     268.4 B                                     
+    64                413.7 B        |       2.60 ×          |     1 074  B                                      
+    128               827.3 B        |       5.20 ×          |     4 298  B                                      
+    256               1 654.6 B      |      10.40 ×          |     17 193  B
+    512               3 309.1 B      |      20.80 ×          |     68 719  B
