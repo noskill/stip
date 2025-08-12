@@ -51,7 +51,7 @@ Move to TEE:
 
 gather attention heads into U′
 
-Output proj. O = U′ Wo′ = (U R)(Rᵀ Wo ) = U Wo (8)
+Output proj. O = U′  Rᵀ Wo = (U R)(Rᵀ Wo ) = U Wo (8)
 
 
 Residual h_out = h + O
@@ -70,37 +70,31 @@ Assumptions
 • TEE executes every operation except the two matrix multiplications inside                                           
   the attention soft-max block (Q Kᵀ and A V). Those two go to the un-trusted device.                                 
                                                                                                                       
-Per-layer FLOPs                                                                     
+Per-layer FLOPs for one new token                                                                   
                                                                                                                       
   TEE                                                                                                                 
     • Q/K/V/O projections: 4 · 4096 × 4096  →  67 M FLOPs / token                                                     
     • Feed-forward (gate, up, down): 3 · 4096 × 11 008  → 135 M FLOPs / token                                         
-    ⇒ 202 M FLOPs per token → 0.202 · L B FLOPs per layer                                                             
+    ⇒ 202 M FLOPs per token → 0.202 B FLOPs per layer                                                             
                                                                                                                       
-  Un-trusted accelerator                                                                                              
-    • Q Kᵀ : 32 · L² · 128                                                                                            
-    • A V  : 32 · L² · 128                                                                                            
-    ⇒ 8 192 · L² FLOPs ≈ 0.008192 · L² B FLOPs per layer 
+  Un-trusted accelerator d = n_heads * head_dim = 32 * 128                                                                                             
+    • Q Kᵀ :  32 · L · 128                                                                                            
+    • A V  :  32 · L · 128                                                                                            
+    ⇒ 8 192 · L FLOPs ≈ 0.000008192 · L B FLOPs per layer 
 
 When amount of compute is equal:
 TEE                     untrusted
-32 * 0.202 * L  = 32 * 0.008192 * L**2
-6.464 L =  0.262144 L**2
-0.262144 L**2 - 6.464 L =  0
-
-D = B**2 - 4a c
-D = 41.78329600000001
-
-L = 6.464 +- 6.464 / (2 * 0.262144) = 24.658203125000004
+0.202  = 0.000008192 * L
+L = 24658
 
 
             ┌───────  TEE  ──────────┐                       ┌──── Un-trusted ──────────┐                     
-L (tokens)    6.464 · L  (B FLOPs)   |   Un-trusted / TEE    |   0.262144 · L² (B FLOPs)                          
+L (tokens)      6.464  (B FLOPs)     |   Un-trusted / TEE    |   0.262144 · L² (B FLOPs)                          
 ─────────   ─────────────────────────┼───────────────────────┼───────────────────────────                         
-    8                 51.7 B         |       0.04 ×          |     2.1 B                                     
-    16                103.4 B        |       0.16 ×          |     16.8 B                                     
-    32                206.9 B        |       1.30 ×          |     268.4 B                                     
-    64                413.7 B        |       2.60 ×          |     1 074  B                                      
-    128               827.3 B        |       5.20 ×          |     4 298  B                                      
-    256               1 654.6 B      |      10.40 ×          |     17 193  B
-    512               3 309.1 B      |      20.80 ×          |     68 719  B
+    1024                6.464 B      |      0.04 ×           |     0.268  B                                     
+    2048                6.464 B      |      0.083 ×          |     0.54   B                                     
+    4096                6.464 B      |      0.166 ×          |     1      B                                     
+    8192                6.464 B      |      0.332 ×          |     2.147  B                                      
+    16384               6.464 B      |      0.664 ×          |     4.29   B                                      
+    32768               6.464 B      |      1.3288 ×         |     8.58   B
+    65536               6.464 B      |      2.657 ×          |     17.17  B
