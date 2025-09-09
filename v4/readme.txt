@@ -1,6 +1,13 @@
-Almost.  You have the right high-level idea ( “ scramble the tokens with a
-secret 500 × 500 matrix, let the GPU do the heavy 4096-wide projection, then
-unscramble with A⁻¹ ” ), but the order of the multiplications matters:
+Good enough llm obsfurcation(GELO) algorithm
+
+We adress the situation when we have trusted execution environment
+which handles LLM inference for users, but we would like to offload some computations to
+the untrusted device.
+
+Offloading Q, K, V projections
+
+We accumulate and build a batch from different users to decrease correlation of embeddings in the batch.
+
 
           tokens × dim         dim × proj-out
     H  ∈  ℝ^{500 × 4096},   W ∈ ℝ^{4096 × 4096}
@@ -21,12 +28,12 @@ Trusted side
 3.  send U to the un-trusted GPU
 
 Un-trusted GPU
-4.  compute                Y =  U · W          ⟨––– cost  d·n·p
+4.  compute                Y =  U · W = A · H · W           ⟨––– cost  d·n·p
                           (shape 500 × 4096)
 5.  return Y
 
 Trusted side
-6.  compute          Q =  A^{-1} · Y           ⟨––– cost  d·n²
+6.  compute          Q =  A^{-1} · Y =  A^{-1} · A · H · W         ⟨––– cost  d·n²
                           (because A^{-1}A = I)
 7.  Q is exactly H·W as in (1).
 
@@ -67,7 +74,4 @@ Things to keep in mind
        – replace the dense A with a fast Hadamard-block; cost goes down
          further but privacy becomes “ICA-hard” rather than “ICA-infeasible”.
 
-But, in short, your understanding of the basic dense-mix / un-mix protocol
-is correct once you keep the multiplication order
 
-        U =  A · H,       Y = U · W,       Q = A^{-1} · Y.
